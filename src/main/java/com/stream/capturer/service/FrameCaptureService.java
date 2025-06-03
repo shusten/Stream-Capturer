@@ -1,74 +1,126 @@
 package com.stream.capturer.service;
 
+import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
-import org.opencv.core.Mat;
-import org.opencv.imgcodecs.Imgcodecs;
-import org.opencv.videoio.VideoCapture;
-import org.springframework.core.io.FileSystemResource;
-import org.springframework.http.MediaType;
+import org.bytedeco.javacv.FFmpegFrameGrabber;
+import org.bytedeco.javacv.Frame;
+import org.bytedeco.javacv.Java2DFrameConverter;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import org.springframework.web.reactive.function.BodyInserters;
-import org.springframework.web.reactive.function.client.WebClient;
-import reactor.core.publisher.Mono;
+import org.bytedeco.ffmpeg.global.avutil;
 
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
 import java.io.File;
-import java.io.IOException;
-import java.nio.file.Files;
 
-@Slf4j
 @Service
+@Slf4j
 public class FrameCaptureService {
 
-    private final WebClient webClient = WebClient.builder()
-            .baseUrl("http://localhost:8000") // URL do CompreFace
-            .build();
+    @Value("${camera.rtsp.url}")
+    private String rtspUrl;
 
-    public Mono<String> capturarEEnviar(String rtspUrl, String apiKey) {
-        log.info("Capturando imagem da câmera: {}", rtspUrl);
+    private volatile boolean capturando = false;
+    private Thread threadCaptura;
 
-        VideoCapture camera = new VideoCapture(rtspUrl);
-        if (!camera.isOpened()) {
-            log.error("Não foi possível abrir o stream RTSP.");
-            return Mono.error(new RuntimeException("Erro ao abrir a câmera."));
+    public synchronized boolean iniciarCaptura() {
+        if (capturando) {
+            log.warn("Captura já está em andamento.");
+            return false;
         }
 
-        Mat frame = new Mat();
-        if (!camera.read(frame)) {
-            log.error("Falha ao capturar frame.");
-            camera.release();
-            return Mono.error(new RuntimeException("Falha ao capturar imagem da câmera."));
-        }
+        capturando = true;
+        log.info("Iniciando captura contínua com FFmpegFrameGrabber a cada 2 segundos...");
 
-        camera.release();
+        threadCaptura = new Thread(() -> {
+            // Silencia os avisos do FFmpeg (como "deprecated pixel format")
+            avutil.av_log_set_level(avutil.AV_LOG_ERROR);
 
-        try {
-            File tempFile = Files.createTempFile("frame_", ".jpg").toFile();
-            Imgcodecs.imwrite(tempFile.getAbsolutePath(), frame);
-            log.info("Frame salvo em {}", tempFile.getAbsolutePath());
+            FFmpegFrameGrabber grabber = null;
 
-            return enviarParaCompreFace(tempFile, apiKey)
-                    .doFinally(signal -> {
-                        if (!tempFile.delete()) {
-                            log.warn("Não foi possível deletar o arquivo temporário: {}", tempFile.getAbsolutePath());
+            try {
+                grabber = new FFmpegFrameGrabber(rtspUrl);
+                grabber.setFormat("rtsp");
+                grabber.setOption("rtsp_transport", "tcp");
+                grabber.start();
+
+                Java2DFrameConverter converter = new Java2DFrameConverter();
+                long ultimoTimestamp = System.currentTimeMillis();
+
+                while (capturando) {
+                    try {
+                        Frame frame = grabber.grabImage();
+
+                        if (frame != null) {
+                            long agora = System.currentTimeMillis();
+                            if (agora - ultimoTimestamp >= 2000) {
+                                BufferedImage imagem = converter.convert(frame);
+                                salvarImagem(imagem);
+                                log.info("Frame capturado com sucesso em {} ms.", agora);
+                                ultimoTimestamp = agora;
+                            }
+                        } else {
+                            log.warn("Frame nulo recebido.");
                         }
-                    });
 
-        } catch (IOException e) {
-            log.error("Erro ao salvar frame como imagem", e);
-            return Mono.error(e);
+                        Thread.sleep(10);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    } catch (Exception e) {
+                        log.error("Erro durante a captura do frame", e);
+                    }
+                }
+
+            } catch (Exception e) {
+                log.error("Erro ao iniciar o stream da câmera", e);
+            } finally {
+                try {
+                    if (grabber != null) {
+                        grabber.stop();
+                        grabber.release();
+                        log.info("Captura encerrada.");
+                    }
+                } catch (Exception e) {
+                    log.error("Erro ao encerrar o stream da câmera", e);
+                }
+            }
+        });
+
+        threadCaptura.start();
+        return true;
+    }
+    public synchronized boolean pararCaptura() {
+        if (!capturando) {
+            return false;
         }
+
+        capturando = false;
+        threadCaptura.interrupt();
+        return true;
     }
 
-    private Mono<String> enviarParaCompreFace(File file, String apiKey) {
-        log.info("Enviando imagem para CompreFace...");
+    @PreDestroy
+    public void encerrar() {
+        pararCaptura();
+    }
 
-        return webClient.post()
-                .uri("/api/v1/recognition/recognize")
-                .header("x-api-key", apiKey)
-                .contentType(MediaType.MULTIPART_FORM_DATA)
-                .body(BodyInserters.fromMultipartData("file", new FileSystemResource(file)))
-                .retrieve()
-                .bodyToMono(String.class)
-                .doOnNext(response -> log.info("Resposta do CompreFace: {}", response));
+    private void salvarImagem(BufferedImage imagem) {
+        try {
+            File pastaCapturas = new File("capturas");
+            if (!pastaCapturas.exists()) {
+                boolean criada = pastaCapturas.mkdirs();
+                if (!criada) {
+                    log.warn("Não foi possível criar a pasta de capturas.");
+                }
+            }
+
+            String nomeArquivo = "captura_" + System.currentTimeMillis() + ".jpg";
+            File arquivo = new File(pastaCapturas, nomeArquivo);
+            ImageIO.write(imagem, "jpg", arquivo);
+            log.info("Imagem salva em: {}", arquivo.getAbsolutePath());
+        } catch (Exception e) {
+            log.error("Erro ao salvar imagem capturada", e);
+        }
     }
 }
